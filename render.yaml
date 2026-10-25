@@ -1,0 +1,20 @@
+# Render "Blueprint": creates the K54 race server in one go. Only SUPABASE_SERVICE_ROLE_KEY is asked for - paste it on Render, never anywhere else.
+services:
+  - type: web
+    name: k54-race
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    numInstances: 1
+    envVars:
+      - key: SUPABASE_URL
+        value: https://thixvzwnzlkbfbagxwgj.supabase.co
+      - key: SUPABASE_ANON_KEY
+        value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRoaXh2enduemxrYmZiYWd4d2dqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI5MzkzNzgsImV4cCI6MjEwODUxNTM3OH0.asKUdJW5FHOPnPa9mHT9mcbXtfzNowJ8g6fhiLMYRkU
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: https://k54game.netlify.app
+      - key: TRUST_PROXY
+        value: "1"

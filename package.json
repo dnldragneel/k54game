@@ -1,0 +1,1 @@
+{ "name": "k54-backend", "private": true, "type": "module", "description": "Edge Functions, race server and tests (no runtime dependencies)" }
