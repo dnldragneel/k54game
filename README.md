@@ -9,3 +9,6 @@ Environment variables (already filled in `render.yaml` except the secret one):
 - `TRUST_PROXY=1` - when behind the host's HTTPS proxy
 
 Check it: open `https://<your-service>.onrender.com/health` - you should see `{"ok":true,...}`.
+
+## Updating
+When a new version of the game ships, upload the new files from this folder to the same GitHub repo (Render redeploys by itself) **and** deploy the new game on Netlify. They share the driving rules (`shared/race-sim.cjs`), so an old server with a new game, or the other way round, makes the car snap back on every update. The game checks the server's protocol version and tells players if the server is older.

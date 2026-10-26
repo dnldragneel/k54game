@@ -10,6 +10,10 @@
   var K = 16;                                                   // checkpoints per lap
   var SEG = 24;                                                 // samples per spline segment
   var CAR_R = 11;
+  var BAR = 10;                                                 // the guard rail keeps the middle of the car at most this far outside the road edge (the picture draws the rail one half car-width further out)
+  var CAR_HL = 12, CAR_HW = 9.5, TR_HL = 12, TR_HW = 9.5;       // half length / half width of a car and of a traffic car
+  var LANES = [-45, -15, 15, 45], LANE_V = [78, 92, 106, 86];   // traffic lanes (lateral offset) and the steady speed of each lane
+  var TR_PER_LANE = 4, NEAR_GAP = 7;                            // traffic cars per lane; a pass closer than this (units) is a "near miss"
 
   function crom(p0, p1, p2, p3, t) {
     var t2 = t * t, t3 = t2 * t;
@@ -34,6 +38,35 @@
   var TRACK = buildTrack();
 
   var clamp = function (v, a, b) { return v < a ? a : v > b ? b : v; };
+  function wrapA(a) { while (a > Math.PI) a -= 2 * Math.PI; while (a < -Math.PI) a += 2 * Math.PI; return a; }
+  function rng(seed) { var a = seed >>> 0; return function () { a = (a + 0x6D2B79F5) >>> 0; var t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  // ---- random traffic: every car is a pure function of (seed, tick), so the server and every browser see exactly the same cars ----
+  function makeTraffic(seed, tr) {
+    tr = tr || TRACK; var r = rng(seed), list = [], lane, k, span = tr.len - 900, gap = 300;
+    for (lane = 0; lane < LANES.length; lane++) {
+      var placed = [], tries = 0;
+      while (placed.length < TR_PER_LANE && tries++ < 600) {
+        var s = 380 + r() * span, ok = true;
+        for (k = 0; k < placed.length; k++) { var d = Math.abs(placed[k] - s); if (d < gap || tr.len - d < gap) ok = false; }
+        if (ok) placed.push(s);
+      }
+      while (placed.length < TR_PER_LANE) placed.push(380 + (placed.length + 0.5) * span / TR_PER_LANE);
+      for (k = 0; k < placed.length; k++) list.push({ id: list.length, s0: placed[k], v: LANE_V[lane], lat: LANES[lane] });
+    }
+    return list;
+  }
+  function trafficAt(list, tick, tr) {
+    tr = tr || TRACK; var out = [], t = tick * DT, i, q;
+    for (i = 0; i < list.length; i++) {
+      q = list[i];
+      var s = (q.s0 + q.v * t) % tr.len, lo = 0, hi = tr.N - 1;
+      while (lo < hi) { var mid = (lo + hi + 1) >> 1; if (tr.cum[mid] <= s) lo = mid; else hi = mid - 1; }
+      var j = (lo + 1) % tr.N, seg = tr.cum[lo + 1] - tr.cum[lo] || 1, f = (s - tr.cum[lo]) / seg, a = tr.pts[lo], b = tr.pts[j];
+      var h = tr.hd[lo] + wrapA(tr.hd[j] - tr.hd[lo]) * f, x = a[0] + (b[0] - a[0]) * f, y = a[1] + (b[1] - a[1]) * f;
+      out.push({ id: q.id, x: x - Math.sin(h) * q.lat, y: y + Math.cos(h) * q.lat, h: h, v: q.v, lane: q.lat });
+    }
+    return out;
+  }
   function clampInput(i) {
     i = i || {};
     var st = +i.st, th = +i.th, br = +i.br;
@@ -59,30 +92,52 @@
   }
   function newCar(id, seat, meta) {
     var g = gridPos(TRACK, seat);
-    return { id: id, seat: seat, st: statsFrom(meta), x: g.x, y: g.y, h: g.h, v: 0, nit: 100, idx: nearest(TRACK, g.x, g.y, -1).idx, P: 0, fin: 0, hits: 0, lapT: 0, best: 0, off: 0 };
+    return { id: id, seat: seat, st: statsFrom(meta), x: g.x, y: g.y, h: g.h, v: 0, nit: 100, idx: nearest(TRACK, g.x, g.y, -1).idx, P: 0, fin: 0, hits: 0, lapT: 0, best: 0, off: 0, ev: 0, tch: 0 };
   }
   // one car, one tick. Pure function of (car, input, track).
-  function stepCar(c, inp, tr) {
-    tr = tr || TRACK; inp = clampInput(inp);
+  // ev (transient, not state): 1 = scraped a rail, 2 = hit a traffic car, 4 = near miss this tick (the browser uses it for sound / pop-ups)
+  function stepCar(c, inp, tr, tf) {
+    tr = tr || TRACK; inp = clampInput(inp); c.ev = 0; var tch = 0;
     var s = c.st, boost = inp.ni && c.nit > 4 ? 1 : 0;
-    var vmax = s.vmax * (boost ? s.boostV : 1) * (c.off ? 0.55 : 1);
+    var vmax = s.vmax * (boost ? s.boostV : 1) * (c.off ? 0.84 : 1);
     var acc = s.acc * (boost ? s.boostA : 1);
     if (boost) c.nit = Math.max(0, c.nit - 45 * DT); else c.nit = Math.min(100, c.nit + 9 * DT);
     if (inp.th > 0 && c.v < vmax) c.v = Math.min(vmax, c.v + acc * inp.th * DT);
-    c.v -= (inp.th > 0 ? 0 : 38) * DT + c.v * 0.18 * DT + (c.off ? 140 * DT : 0);       // drag, coasting, grass
+    c.v -= (inp.th > 0 ? 0 : 38) * DT + c.v * 0.18 * DT + (c.off ? 26 * DT : 0);         // drag, coasting, a little extra on the grass
     if (inp.br > 0) c.v -= s.brake * inp.br * DT;
     if (c.v > vmax) c.v -= 260 * DT;                                                       // bleed off excess (leaving boost / entering grass)
     if (c.v < 0) c.v = 0;
     var speedF = clamp(c.v / 45, 0, 1), turn = inp.st * s.turn * (1 - 0.42 * clamp(c.v / (s.vmax * 1.1), 0, 1)) * speedF;
     c.h += turn * DT;
     c.x += Math.cos(c.h) * c.v * DT; c.y += Math.sin(c.h) * c.v * DT;
+    // traffic: touching a car costs speed and pushes you out of it; skimming past one at speed charges the nitro (a "near miss")
+    if (tf) for (var ti = 0; ti < tf.length; ti++) {
+      var q = tf[ti], tdx = c.x - q.x, tdy = c.y - q.y;
+      if (tdx * tdx + tdy * tdy > 3600) continue;
+      var qc = Math.cos(q.h), qs = Math.sin(q.h), dl = tdx * qc + tdy * qs, dw = -tdx * qs + tdy * qc, adl = Math.abs(dl), adw = Math.abs(dw);
+      var penL = CAR_HL + TR_HL - adl, penW = CAR_HW + TR_HW - adw;
+      if (penL > 0 && penW > 0) {
+        if (penW < penL) { var sg = dw >= 0 ? 1 : -1; c.x += -qs * sg * (penW + 0.3); c.y += qc * sg * (penW + 0.3); c.v *= 0.9; }   // side swipe
+        else if (dl < 0) { c.x -= qc * (penL + 0.3); c.y -= qs * (penL + 0.3); if (c.v > q.v * 0.7) c.v = q.v * 0.7; }               // rear-ended it
+        else { c.x += qc * (penL + 0.3); c.y += qs * (penL + 0.3); }
+        tch |= 2; c.ev |= 2; if (!(c.tch & 2)) c.hits++;
+      } else if (adl < CAR_HL + TR_HL + 6 && adw < CAR_HW + TR_HW + NEAR_GAP && c.v - q.v > 40) {
+        var gp = adw - (CAR_HW + TR_HW); c.nit = Math.min(100, c.nit + 70 * (1 - gp / NEAR_GAP) * DT); c.ev |= 4;
+      }
+    }
     // track relation
     var nr = nearest(tr, c.x, c.y, c.idx);
     var p = tr.pts[nr.idx];
-    if (nr.dist > tr.half + 38) {                                                          // hard barrier outside the grass margin
-      var k = (tr.half + 38) / nr.dist; c.x = p[0] + (c.x - p[0]) * k; c.y = p[1] + (c.y - p[1]) * k; c.v *= 0.55; c.hits++;
+    var bar = tr.half + BAR;
+    if (nr.dist > bar) {                                                                   // guard rail: it slides you along the wall, it never glues you to it
+      var kk = bar / nr.dist; c.x = p[0] + (c.x - p[0]) * kk; c.y = p[1] + (c.y - p[1]) * kk;
+      var th = tr.hd[nr.idx], rel = wrapA(c.h - th), side = ((c.x - p[0]) * -Math.sin(th) + (c.y - p[1]) * Math.cos(th)) >= 0 ? 1 : -1;
+      var out = side * Math.sin(rel);                                                      // > 0: the nose points into the rail
+      var fwd = Math.abs(rel) <= Math.PI / 2, tgt = (fwd ? th : th + Math.PI) + (fwd ? -side : side) * 0.2;   // along the rail, nose a touch back toward the road
+      if (out > 0) { c.h = tgt + wrapA(c.h - tgt) * 0.5; c.v *= 1 - 0.5 * out; if (out > 0.25) { tch |= 1; c.ev |= 1; if (!(c.tch & 1)) c.hits++; } }
+      c.v = Math.max(0, c.v - 25 * DT);                                                    // paint scraping the rail
     }
-    c.off = nr.dist > tr.half ? 1 : 0;
+    c.off = nr.dist > tr.half ? 1 : 0; c.tch = tch;
     var prev = c.idx; c.idx = nr.idx;
     c.lapT += DT;
     // checkpoint gating: gates must be passed in order, only moving forward. P = gates passed so far (the start line is gate 0).
@@ -94,9 +149,10 @@
     }
     return c;
   }
-  function newRace(players, laps) {
+  function newRace(players, laps, seed) {
     var cars = players.map(function (p, i) { return newCar(p.id, i, p.meta); });
-    return { tick: 0, laps: laps || 3, cars: cars, order: [], start: 0 };
+    seed = seed | 0;
+    return { tick: 0, laps: laps || 3, cars: cars, order: [], start: 0, seed: seed, traffic: seed ? makeTraffic(seed) : [] };
   }
   // monotone progress number: gates passed * 1000 + how far to the next gate (0..999)
   function progress(w, c) {
@@ -109,10 +165,11 @@
   function stepWorld(w, inputs) {
     var i, j, cars = w.cars;
     w.tick++;
+    var tf = w.traffic && w.traffic.length ? trafficAt(w.traffic, w.tick) : null;
     for (i = 0; i < cars.length; i++) {
       var c = cars[i];
       if (c.fin) { c.v = Math.max(0, c.v - 120 * DT); c.x += Math.cos(c.h) * c.v * DT; c.y += Math.sin(c.h) * c.v * DT; continue; }
-      stepCar(c, inputs[c.id], TRACK);
+      stepCar(c, inputs[c.id], TRACK, tf);
       if (c.P >= w.laps * TRACK.K + 1 && !c.fin) { c.fin = w.tick; w.order.push(c.id); }
     }
     // Cars do NOT collide: racers drive straight through each other ("ghost" overtaking), so nobody can block or wreck another player.
@@ -125,13 +182,13 @@
     return fin.concat(rest);
   }
   // client side: adopt the server's state for my car, then replay the inputs the server has not applied yet
-  function applyAuth(car, a, pending, tr) {
+  function applyAuth(car, a, pending, tr, tfo) {          // tfo = { list: w.traffic, k: tick of the snapshot } - needed to replay traffic contacts
     tr = tr || TRACK;
     car.x = a.x; car.y = a.y; car.h = a.h; car.v = a.v; car.P = a.P; car.nit = a.nit; car.fin = a.fin; car.hits = a.hits;
     var nr = nearest(tr, car.x, car.y, -1); car.idx = nr.idx; car.off = nr.dist > tr.half ? 1 : 0;
-    for (var i = 0; i < pending.length; i++) stepCar(car, pending[i], tr);
+    for (var i = 0; i < pending.length; i++) stepCar(car, pending[i], tr, tfo && tfo.list && tfo.list.length ? trafficAt(tfo.list, tfo.k + 1 + i, tr) : null);
     return car;
   }
-  return { applyAuth: applyAuth, HZ: HZ, DT: DT, TRACK: TRACK, K: K, CAR_R: CAR_R, clampInput: clampInput, statsFrom: statsFrom, newCar: newCar, stepCar: stepCar,
+  return { applyAuth: applyAuth, makeTraffic: makeTraffic, trafficAt: trafficAt, BAR: BAR, LANES: LANES, HZ: HZ, DT: DT, TRACK: TRACK, K: K, CAR_R: CAR_R, clampInput: clampInput, statsFrom: statsFrom, newCar: newCar, stepCar: stepCar,
            newRace: newRace, stepWorld: stepWorld, lapsDone: lapsDone, ranking: ranking, progress: progress, nearest: nearest, gridPos: gridPos };
 });

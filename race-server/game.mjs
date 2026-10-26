@@ -7,7 +7,11 @@ const Sim = createRequire(import.meta.url)('../shared/race-sim.cjs');
 export const DEFAULTS = {
   laps: 3, minPlayers: 2, maxPlayers: 3, countdownMs: 3500, fullStartDelayMs: 3000, minStartWaitMs: 15000, readyStartDelayMs: 1500,
   finishTimeoutMs: 20000, graceMs: 15000, lobbyGraceMs: 10000, soloWaitMs: 90000, resultsKeepMs: 60000, helloTimeoutMs: 5000, maxRooms: 300, commitRetries: 3,
+  traffic: true, reactGapMs: 600,
 };
+// the only reactions a player can send (no free text, so nothing to moderate): the app maps each to its emoji
+export const PROTOCOL = 2;                                          // 2 = guard rails + shared traffic seed + reactions; the app refuses an older race server (its rules would not match)
+export const REACTIONS = ['laugh', 'smile', 'cool', 'thumbs', 'cry'];
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const r1 = (n) => Math.round(n * 10) / 10;
 
@@ -17,7 +21,7 @@ export function createGame(userCfg, supa, log = () => {}) {
   const timers = new Set();
   let openPublic = null;                                              // the public room that is still filling up
   const later = (ms, fn) => { const t = setTimeout(() => { timers.delete(t); fn(); }, ms); timers.add(t); return t; };
-  const stats = { started: 0, finished: 0, commitFailures: 0 };
+  const stats = { started: 0, finished: 0, commitFailures: 0, reactions: 0 };
 
   const out = (conn, obj) => conn && !conn.closed && conn.send(JSON.stringify(obj));
 
@@ -62,7 +66,8 @@ export function createGame(userCfg, supa, log = () => {}) {
       if (this.status !== 'lobby') return;
       if (this.connected.length < cfg.minPlayers) return this.evaluate();
       this.status = 'countdown'; this.startAt = 0; this.sendLobby();
-      this.broadcast({ t: 'countdown', ms: cfg.countdownMs });
+      this.seed = cfg.traffic ? randomInt(1, 2147483647) : 0;                          // one traffic pattern per race, the same for every driver
+      this.broadcast({ t: 'countdown', ms: cfg.countdownMs, seed: this.seed });
       this.startTimer = later(cfg.countdownMs, () => this.go());
     }
     go() {
@@ -71,7 +76,8 @@ export function createGame(userCfg, supa, log = () => {}) {
       for (const p of this.players) if (!p.connected) p.left = true;                      // someone vanished during the countdown
       this.players = this.players.filter((p) => !p.left); this.players.forEach((p, i) => (p.seat = i));
       this.status = 'racing'; stats.started++;
-      this.world = Sim.newRace(this.players.map((p) => ({ id: p.userId, meta: p.car.meta })), cfg.laps);
+      if (this.seed == null) this.seed = cfg.traffic ? randomInt(1, 2147483647) : 0;
+      this.world = Sim.newRace(this.players.map((p) => ({ id: p.userId, meta: p.car.meta })), cfg.laps, this.seed);
       this.startedAt = Date.now();
       for (const p of this.players) { p.q = []; p.nextIn = 0; p.ack = -1; p.lastIn = Sim.clampInput({}); }
       this.broadcast(this.startMsg()); this.broadcast({ t: 'go' });
@@ -79,7 +85,7 @@ export function createGame(userCfg, supa, log = () => {}) {
       log('race_start', { room: this.id, mode: this.mode, players: this.players.length });
     }
     startMsg() {
-      return { t: 'start', room: this.id, laps: cfg.laps, hz: Sim.HZ, seats: this.players.map((p) => ({ seat: p.seat, id: p.userId, name: p.name, level: p.level, car: p.car.id, carName: p.car.name, stats: p.car.meta, deco: p.deco })) };
+      return { t: 'start', room: this.id, laps: cfg.laps, hz: Sim.HZ, seed: this.seed || 0, seats: this.players.map((p) => ({ seat: p.seat, id: p.userId, name: p.name, level: p.level, car: p.car.id, carName: p.car.name, stats: p.car.meta, deco: p.deco })) };
     }
     tickLoop() {
       if (this.status !== 'racing') return;
@@ -99,7 +105,7 @@ export function createGame(userCfg, supa, log = () => {}) {
         inputs[p.userId] = inp;
       }
       Sim.stepWorld(w, inputs);
-      if (w.tick % 2 === 0) {
+      {
         const cars = w.cars.map((c, i) => [i, r1(c.x), r1(c.y), Math.round(c.h * 1000) / 1000, r1(c.v), c.P, Math.round(c.nit), c.fin ? 1 : 0, c.hits]);
         for (const p of this.players) if (p.connected && p.conn && !p.left) p.conn.send(JSON.stringify({ t: 's', k: w.tick, a: p.ack, c: cars }));
       }
@@ -174,6 +180,7 @@ export function createGame(userCfg, supa, log = () => {}) {
     if (!m || typeof m !== 'object' || typeof m.t !== 'string') return;
     if (m.t === 'in') return onInput(s, m);
     if (m.t === 'ping') return s.send({ t: 'pong', c: m.c, s: Date.now() });
+    if (m.t === 'react') return onReact(s, m);
     if (m.t === 'hello') return onHello(s, m);
     if (!s.authed) return;
     if (s.busy) return s.err('busy');                                   // one lobby action at a time per connection
@@ -191,7 +198,7 @@ export function createGame(userCfg, supa, log = () => {}) {
     const old = sessions.get(user.id);
     if (old && old !== s) { old.replaced = true; old.conn.close(4001, 'replaced'); }
     s.user = user; s.authed = true; sessions.set(user.id, s);
-    s.send({ t: 'welcome', id: user.id, hz: Sim.HZ, v: 1 });
+    s.send({ t: 'welcome', id: user.id, hz: Sim.HZ, v: PROTOCOL });
     const room = userRoom.get(user.id);                                  // reconnect: pick up where we left off
     if (room) {
       const p = room.players.find((x) => x.userId === user.id);
@@ -263,6 +270,16 @@ export function createGame(userCfg, supa, log = () => {}) {
     while (p.nextIn < n) { p.q.push({ idx: p.nextIn++, inp: p.lastQ }); }   // short gap: repeat the last input
     const inp = Sim.clampInput(m); p.lastQ = inp; p.q.push({ idx: n, inp }); p.nextIn = n + 1;
     if (p.q.length > 6) { const drop = p.q.splice(0, p.q.length - 6); p.ack = drop[drop.length - 1].idx; }   // client running ahead: skip old inputs
+  }
+
+  // a quick emoji from a driver, shown to everyone in the race above that car and in the live feed (whitelisted, rate limited)
+  function onReact(s, m) {
+    const room = s.room, p = s.player;
+    if (!room || !p || p.left || (room.status !== 'racing' && room.status !== 'countdown')) return;
+    if (typeof m.e !== 'string' || !REACTIONS.includes(m.e)) return;
+    const now = Date.now(); if (now - (p.reactAt || 0) < cfg.reactGapMs) return;
+    p.reactAt = now; stats.reactions++;
+    room.broadcast({ t: 'react', seat: p.seat, e: m.e });
   }
 
   function onConnection(conn) {
