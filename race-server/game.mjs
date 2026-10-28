@@ -1,16 +1,16 @@
-// Authoritative 1v1v1 race server logic: lobbies, matchmaking, private rooms, countdown, simulation, results, reconnect.
+// Authoritative race server logic (2 to 5 players): lobbies, matchmaking, private rooms, countdown, simulation, results, reconnect.
 // Transport-agnostic: it works on "conn" objects with send(text) / close(code, reason) / onmessage / onclose (see ws.mjs).
 import { createRequire } from 'node:module';
 import { randomUUID, randomInt } from 'node:crypto';
 const Sim = createRequire(import.meta.url)('../shared/race-sim.cjs');
 
 export const DEFAULTS = {
-  laps: 3, minPlayers: 2, maxPlayers: 3, countdownMs: 3500, fullStartDelayMs: 3000, minStartWaitMs: 15000, readyStartDelayMs: 1500,
+  laps: 3, minPlayers: 2, maxPlayers: 5, countdownMs: 5600, fullStartDelayMs: 3000, minStartWaitMs: 15000, readyStartDelayMs: 1500,
   finishTimeoutMs: 20000, graceMs: 15000, lobbyGraceMs: 10000, soloWaitMs: 90000, resultsKeepMs: 60000, helloTimeoutMs: 5000, maxRooms: 300, commitRetries: 3,
   traffic: true, reactGapMs: 600,
 };
 // the only reactions a player can send (no free text, so nothing to moderate): the app maps each to its emoji
-export const PROTOCOL = 2;                                          // 2 = guard rails + shared traffic seed + reactions; the app refuses an older race server (its rules would not match)
+export const PROTOCOL = 3;                                          // 3 = up to five racers + a 5-4-3-2-1 start (countdown message carries the grid); 2 = guard rails + shared traffic seed + reactions; the app refuses an older race server (its rules would not match)
 export const REACTIONS = ['laugh', 'smile', 'cool', 'thumbs', 'cry'];
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const r1 = (n) => Math.round(n * 10) / 10;

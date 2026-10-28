@@ -86,7 +86,7 @@
     return { idx: best, dist: Math.sqrt(bd) };
   }
   function gridPos(tr, seat) {
-    var back = [26, 64, 102][seat] || 26, lat = [-20, 20, -20][seat] || 0;
+    var back = 26 + (seat | 0) * 32, lat = (seat & 1) ? 20 : -20;                         // five staggered slots (two abreast), 32 units apart behind the line
     var i0 = 0, h = tr.hd[i0], p = tr.pts[i0], cx = Math.cos(h), sy = Math.sin(h);
     return { x: p[0] - cx * back - sy * lat, y: p[1] - sy * back + cx * lat, h: h };
   }
