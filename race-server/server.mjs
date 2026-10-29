@@ -12,9 +12,10 @@ export function createServer(env = process.env, supaOverride = null) {
   const log = (ev, o = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), ev, ...o }));
   const num = (k, d) => (env[k] !== undefined && env[k] !== '' ? Number(env[k]) : d);
   const game = createGame({
-    laps: num('LAPS', 3), maxPlayers: num('MAX_PLAYERS', 5), countdownMs: num('COUNTDOWN_MS', 5600), fullStartDelayMs: num('FULL_START_DELAY_MS', 3000), minStartWaitMs: num('MIN_START_WAIT_MS', 15000),
+    laps: num('LAPS', 3), maxPlayers: num('MAX_PLAYERS', 10), countdownMs: num('COUNTDOWN_MS', 5600), fullStartDelayMs: num('FULL_START_DELAY_MS', 3000), minStartWaitMs: num('MIN_START_WAIT_MS', 15000),
     readyStartDelayMs: num('READY_START_DELAY_MS', 1500), finishTimeoutMs: num('FINISH_TIMEOUT_MS', 20000), graceMs: num('RECONNECT_GRACE_MS', 15000), lobbyGraceMs: num('LOBBY_GRACE_MS', 10000),
-    resultsKeepMs: num('RESULTS_KEEP_MS', 60000),
+    resultsKeepMs: num('RESULTS_KEEP_MS', 60000), botOfferMs: num('BOT_OFFER_MS', 30000), botCount: num('BOT_COUNT', 5),
+    quizAnswerMs: num('QUIZ_ANSWER_MS', 7000), ...(env.QUIZ_GATES ? { quizGates: String(env.QUIZ_GATES).split(',').map(Number).filter((n) => Number.isInteger(n) && n > 0) } : {}),
   }, supa, log);
   const allowed = String(env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
   const maxPerIp = num('MAX_CONN_PER_IP', 8), perIp = new Map(), trustProxy = env.TRUST_PROXY === '1';

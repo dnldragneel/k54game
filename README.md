@@ -1,6 +1,6 @@
 # K54 race server
 
-Hosts the live races (2 to 5 players per race; protocol 3). Needs only Node 22 (the Dockerfile does the rest). One instance only: races live in memory.
+Hosts the live races (2 to 10 players per race; protocol 6: three traffic lanes, ten racers, three race modes - normal / power-ups / road-sign quiz -, practice races against bots, reversing, and private rooms whose host can allow car crashes and switch traffic on or off). Needs only Node 22 (the Dockerfile does the rest). One instance only: races live in memory.
 
 Environment variables (already filled in `render.yaml` except the secret one):
 - `SUPABASE_URL`, `SUPABASE_ANON_KEY` - public values for your project
