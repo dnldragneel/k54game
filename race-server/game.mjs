@@ -2,6 +2,7 @@
 // Transport-agnostic: it works on "conn" objects with send(text) / close(code, reason) / onmessage / onclose (see ws.mjs).
 import { createRequire } from 'node:module';
 import { randomUUID, randomInt } from 'node:crypto';
+import { createDuels, DUEL_MSGS } from './duel.mjs';
 const req = createRequire(import.meta.url);
 const Sim = req('../shared/race-sim.cjs');
 const QUIZ = req('../shared/quiz-bank.json');                        // { id: index of the right answer } for the road-sign questions of the quiz race
@@ -15,7 +16,7 @@ export const DEFAULTS = {
 };
 export const VARIANTS = ['normal', 'power', 'quiz'];                 // the three race modes: a normal race, a race with power-ups, a race with road-sign questions
 // the only reactions a player can send (no free text, so nothing to moderate): the app maps each to its emoji
-export const PROTOCOL = 6;                                          // 6 = private rooms can switch crashes and traffic on/off (lobby / countdown / start carry crash + traffic, 'opts' message, 'c' crash news); 5 = up to ten racers, three race modes, bot practice, brake reverses
+export const PROTOCOL = 7;                                          // 7 = 1v1 duels (dqueue / dask / dend ...; see duel.mjs) and races pay no coins; 6 = private rooms can switch crashes and traffic on/off (lobby / countdown / start carry crash + traffic, 'opts' message, 'c' crash news); 5 = up to ten racers, three race modes, bot practice, brake reverses
 export const REACTIONS = ['laugh', 'smile', 'cool', 'thumbs', 'cry'];
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const r1 = (n) => Math.round(n * 10) / 10;
@@ -41,6 +42,7 @@ export function createGame(userCfg, supa, log = () => {}) {
   const stats = { started: 0, finished: 0, commitFailures: 0, reactions: 0, practice: 0 };
 
   const out = (conn, obj) => conn && !conn.closed && conn.send(JSON.stringify(obj));
+  const duels = createDuels(cfg.duel || {}, supa, log, { later, out, inRace: (id) => userRoom.has(id) });
 
   class Room {
     constructor(mode, variant, rules) {
@@ -269,6 +271,7 @@ export function createGame(userCfg, supa, log = () => {}) {
     if (m.t === 'qa') return onQuizAnswer(s, m);
     if (m.t === 'hello') return onHello(s, m);
     if (!s.authed) return;
+    if (DUEL_MSGS.has(m.t)) return duels.handle(s, m).catch((e) => { log('duel_error', { t: m.t, err: String(e.message || e) }); s.dbusy = false; s.err('server_error'); });
     if (s.busy) return s.err('busy');                                   // one lobby action at a time per connection
     s.busy = true;
     try { await lobbyAction(s, m); } catch (e) { log('action_error', { t: m.t, err: String(e.message || e) }); s.err('server_error'); } finally { s.busy = false; }
@@ -296,13 +299,14 @@ export function createGame(userCfg, supa, log = () => {}) {
         if (room.status === 'lobby') room.evaluate();
       }
     }
+    duels.resume(s);                                                      // an interrupted duel (or a place in the duel queue) continues too
   }
 
   async function lobbyAction(s, m) {
     const room = s.room, p = s.player;
     switch (m.t) {
       case 'queue': {
-        if (room) return s.err('already_in_room');
+        if (room || duels.busy(s.user.id)) return s.err('already_in_room');
         if (rooms.size >= cfg.maxRooms) return s.err('server_busy');
         const e = await enter(s, m.car); if (!e) return;
         if (s.room) return s.err('already_in_room');
@@ -314,7 +318,7 @@ export function createGame(userCfg, supa, log = () => {}) {
         r.evaluate(); return;
       }
       case 'create': {
-        if (room) return s.err('already_in_room');
+        if (room || duels.busy(s.user.id)) return s.err('already_in_room');
         if (rooms.size >= cfg.maxRooms) return s.err('server_busy');
         const e = await enter(s, m.car); if (!e) return;
         const code = newCode(); if (!code) return s.err('server_busy');
@@ -322,7 +326,7 @@ export function createGame(userCfg, supa, log = () => {}) {
         r.add(mkPlayer(s, e)); userRoom.set(s.user.id, r); r.evaluate(); return;
       }
       case 'join': {
-        if (room) return s.err('already_in_room');
+        if (room || duels.busy(s.user.id)) return s.err('already_in_room');
         const code = String(m.code || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
         const r = codes.get(code);
         if (!r || r.status !== 'lobby') return s.err('room_not_found');
@@ -398,6 +402,7 @@ export function createGame(userCfg, supa, log = () => {}) {
       clearTimeout(hello);
       if (!s.user || s.replaced) return;
       if (sessions.get(s.user.id) === s) sessions.delete(s.user.id);
+      duels.onClose(s);
       const room = userRoom.get(s.user.id); const p = room?.players.find((x) => x.userId === s.user.id);
       if (!room || !p) return;
       p.connected = false; p.dcAt = Date.now();
@@ -409,8 +414,8 @@ export function createGame(userCfg, supa, log = () => {}) {
   }
 
   return {
-    onConnection, cfg, stats, debug: { rooms },
-    snapshot() { let lobby = 0, racing = 0; for (const r of rooms.values()) { if (r.status === 'racing') racing++; else if (r.status === 'lobby' || r.status === 'countdown') lobby++; } return { sessions: sessions.size, rooms: rooms.size, lobby, racing, ...stats }; },
-    stop() { for (const t of timers) clearTimeout(t); for (const r of rooms.values()) { clearTimeout(r.startTimer); clearTimeout(r.loop); clearTimeout(r.soloTimer); clearTimeout(r.offerTimer); } },
+    onConnection, cfg, stats, duels, debug: { rooms },
+    snapshot() { let lobby = 0, racing = 0; for (const r of rooms.values()) { if (r.status === 'racing') racing++; else if (r.status === 'lobby' || r.status === 'countdown') lobby++; } return { sessions: sessions.size, rooms: rooms.size, lobby, racing, ...stats, ...duels.snapshot() }; },
+    stop() { duels.stop(); for (const t of timers) clearTimeout(t); for (const r of rooms.values()) { clearTimeout(r.startTimer); clearTimeout(r.loop); clearTimeout(r.soloTimer); clearTimeout(r.offerTimer); } },
   };
 }

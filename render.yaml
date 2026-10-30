@@ -15,6 +15,6 @@ services:
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
       - key: ALLOWED_ORIGINS
-        value: https://k54game.netlify.app
+        value: https://k54game.netlify.app,https://localhost
       - key: TRUST_PROXY
         value: "1"

@@ -15,6 +15,8 @@ export function createServer(env = process.env, supaOverride = null) {
     laps: num('LAPS', 3), maxPlayers: num('MAX_PLAYERS', 10), countdownMs: num('COUNTDOWN_MS', 5600), fullStartDelayMs: num('FULL_START_DELAY_MS', 3000), minStartWaitMs: num('MIN_START_WAIT_MS', 15000),
     readyStartDelayMs: num('READY_START_DELAY_MS', 1500), finishTimeoutMs: num('FINISH_TIMEOUT_MS', 20000), graceMs: num('RECONNECT_GRACE_MS', 15000), lobbyGraceMs: num('LOBBY_GRACE_MS', 10000),
     resultsKeepMs: num('RESULTS_KEEP_MS', 60000), botOfferMs: num('BOT_OFFER_MS', 30000), botCount: num('BOT_COUNT', 5),
+    duel: Object.fromEntries([['startMs', 'DUEL_START_MS'], ['revealMs', 'DUEL_REVEAL_MS'], ['graceMs', 'DUEL_GRACE_MS'], ['botOfferMs', 'DUEL_BOT_OFFER_MS'], ['waitMaxMs', 'DUEL_WAIT_MAX_MS'], ['tickMs', 'DUEL_TICK_MS'], ['questions', 'DUEL_QUESTIONS'], ['answerMs', 'DUEL_ANSWER_MS']]
+      .filter(([, k]) => env[k] !== undefined && env[k] !== '').map(([c, k]) => [c, Number(env[k])])),
     quizAnswerMs: num('QUIZ_ANSWER_MS', 7000), ...(env.QUIZ_GATES ? { quizGates: String(env.QUIZ_GATES).split(',').map(Number).filter((n) => Number.isInteger(n) && n > 0) } : {}),
   }, supa, log);
   const allowed = String(env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
