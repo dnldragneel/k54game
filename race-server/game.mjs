@@ -1,4 +1,4 @@
-// Authoritative race server logic (2 to 10 players, three race modes, practice races against bots): lobbies, matchmaking, private rooms, countdown, simulation, results, reconnect.
+// Authoritative race server logic (2 to 10 players, two race modes, four tracks, practice races against bots): lobbies, matchmaking, private rooms, loading barrier, intro + countdown, simulation, results, reconnect.
 // Transport-agnostic: it works on "conn" objects with send(text) / close(code, reason) / onmessage / onclose (see ws.mjs).
 import { createRequire } from 'node:module';
 import { randomUUID, randomInt } from 'node:crypto';
@@ -8,15 +8,16 @@ const Sim = req('../shared/race-sim.cjs');
 const QUIZ = req('../shared/quiz-bank.json');                        // { id: index of the right answer } for the road-sign questions of the quiz race
 
 export const DEFAULTS = {
-  laps: 3, minPlayers: 2, maxPlayers: 10, countdownMs: 5600, fullStartDelayMs: 3000, minStartWaitMs: 15000, readyStartDelayMs: 1500,
-  finishTimeoutMs: 20000, graceMs: 15000, lobbyGraceMs: 10000, soloWaitMs: 90000, resultsKeepMs: 60000, helloTimeoutMs: 5000, maxRooms: 300, commitRetries: 3,
+  laps: 3, minPlayers: 2, maxPlayers: 10, countdownMs: 5600, introMs: 4200, loadMinMs: 4500, loadMaxMs: 22000, fullStartDelayMs: 3000, minStartWaitMs: 15000, readyStartDelayMs: 1500,
+  finishTimeoutMs: 25000, lootDailyCap: 5, graceMs: 15000, lobbyGraceMs: 10000, soloWaitMs: 90000, resultsKeepMs: 60000, helloTimeoutMs: 5000, maxRooms: 300, commitRetries: 3,
   traffic: true, reactGapMs: 600,
   botOfferMs: 30000, botCount: 5, practiceEndMs: 6000,                // alone in the queue for this long -> offer a practice race against bots; how many bots; how long after the human finishes the practice race closes
   quizAnswerMs: 7000, quizGates: [4, 9, 14],                          // quiz race: time to answer, and the checkpoints (of 16) where a question pops up each lap
 };
-export const VARIANTS = ['normal', 'power', 'quiz'];                 // the three race modes: a normal race, a race with power-ups, a race with road-sign questions
+export const VARIANTS = ['normal', 'power'];                         // the two race modes: a normal race and a race with power-ups (the sign-quiz race was removed; an old app that asks for it gets a normal race)
 // the only reactions a player can send (no free text, so nothing to moderate): the app maps each to its emoji
-export const PROTOCOL = 7;                                          // 7 = 1v1 duels (dqueue / dask / dend ...; see duel.mjs) and races pay no coins; 6 = private rooms can switch crashes and traffic on/off (lobby / countdown / start carry crash + traffic, 'opts' message, 'c' crash news); 5 = up to ten racers, three race modes, bot practice, brake reverses
+// 8 = four tracks + skins (lobby / load / start carry track, skin, laps), crashes on by default, drifting (input 'dr'), ramps, a LOADING step before the countdown (server 'load' -> every driver answers 'loaded'; the race starts when all have), an intro before the countdown, richer news and results (awards, loot box). Clients must say hello with pv >= 8.
+export const PROTOCOL = 8;                                          // 7 = 1v1 duels (dqueue / dask / dend ...; see duel.mjs) and races pay no coins; 6 = private rooms can switch crashes and traffic on/off (lobby / countdown / start carry crash + traffic, 'opts' message, 'c' crash news); 5 = up to ten racers, three race modes, bot practice, brake reverses
 export const REACTIONS = ['laugh', 'smile', 'cool', 'thumbs', 'cry'];
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const r1 = (n) => Math.round(n * 10) / 10;
@@ -25,6 +26,16 @@ const shuffle = (a) => { for (let i = a.length - 1; i > 0; i--) { const j = rand
 const BOT_NAMES = ['Sipho', 'Thandi', 'Lerato', 'Kagiso', 'Naledi', 'Themba', 'Zinhle', 'Pieter', 'Aisha', 'Bongani', 'Refilwe', 'Johan', 'Ayanda', 'Tumi'];
 const BOT_CARS = { polo: 'City Hatch', hilux: 'Bakkie 4x4', quantum: 'Minibus Taxi', golf: 'Hot Hatch', bmw: 'Executive Sedan', audi: 'Sport Coupe', fortuner: 'Safari SUV', tesla: 'Electric Sedan', rally: 'Rally Hatch', super: 'Supercar' };
 const clampN = (v, a, b) => Math.max(a, Math.min(b, v));
+// the race news the browsers get (short arrays): z zap, c crash, g got a power-up, u used one, d drift boost, j jump, l landing, t takedown, L lap done, w new leader, f slipstream
+const fxOf = (x) => (x.k === 'zap' ? ['z', x.seat, x.to, x.blocked] : x.k === 'crash' ? ['c', x.a, x.b, x.f] : x.k === 'get' ? ['g', x.seat, x.it] : x.k === 'use' ? ['u', x.seat, x.it] : x.k === 'drift' ? ['d', x.seat, x.big]
+  : x.k === 'jump' ? ['j', x.seat] : x.k === 'land' ? ['l', x.seat, x.ok, x.ms] : x.k === 'take' ? ['t', x.a, x.b] : x.k === 'lap' ? ['L', x.seat, x.n, x.ms, x.best, x.clean] : x.k === 'lead' ? ['w', x.seat] : x.k === 'draft' ? ['f', x.seat] : ['?']);
+const flagsOf = (c) => (c.df ? 1 : 0) | (c.ai > 0 ? 2 : 0) | (c.so ? 4 : 0) | (c.mt > 0 ? 8 : 0) | (c.gh > 0 ? 16 : 0) | (c.dd >= Sim.DRAFT_MIN ? 32 : 0) | (c.bo ? 64 : 0);
+// the little prizes after a race: one racer each for the fastest lap, the longest drifting, the most air time, the most takedowns and the cleanest driving
+function awardsOf(rows) {
+  const list = [], best = (k, val, min, cmp = (a, b) => a > b) => { let w = null; for (const r of rows) { const v = val(r); if (v === null || v === undefined || v < min) continue; if (!w || cmp(v, w.v)) w = { k, seat: r.seat, v }; } if (w) list.push(w); };
+  best('fast', (r) => r.best_lap_ms, 1, (a, b) => a < b); best('drift', (r) => r.st.drift, 2); best('air', (r) => r.st.air, 1); best('ram', (r) => r.st.takedowns, 1); best('clean', (r) => (r.st.clean > 0 ? r.st.clean * 100 - r.collisions : null), 1);
+  return list;
+}
 // a bot: a random car model, with the speed of the human's own car dialled down a little (the better bots are close to it), so a practice race is fair for any car
 function mkBot(i, n, name, carKey, human) {
   const skill = n > 1 ? 0.97 - i * (0.17 / (n - 1)) : 0.9, f = 0.9 + (skill - 0.8) * 0.5, m = human.car.meta || {};
@@ -47,19 +58,27 @@ export function createGame(userCfg, supa, log = () => {}) {
   class Room {
     constructor(mode, variant, rules) {
       this.id = randomUUID(); this.mode = mode; this.variant = VARIANTS.includes(variant) ? variant : 'normal'; this.setRules(rules); this.status = 'lobby'; this.players = []; this.code = null; this.host = null;
-      this.createdAt = Date.now(); this.minSince = 0; this.startTimer = null; this.startAt = 0; this.world = null; this.loop = null;
+      this.createdAt = Date.now(); this.minSince = 0; this.startTimer = null; this.startAt = 0; this.world = null; this.loop = null; this.loadStart = 0; this.loadMinTimer = null; this.loadMaxTimer = null;
       this.firstFinishAt = 0; this.committed = false; this.practice = false; this.offer = false; this.soloOn = false; this.humanDoneAt = 0;
     }
-    // house rules: only a private room can change them (its host). Public races and practice races always have traffic and no crashes.
+    // house rules: only a private room (its host) can change them. Quick matches always have crashes + traffic + 3 laps on a random track and skin (picked when the race loads).
+    // A private room: track, skin ('auto' = a random one of that track's skins every race), laps 1-10 (default = the track's own), crashes, traffic.
     setRules(r) {
-      this.crash = this.mode === 'private' && !!r && (r.crash === 1 || r.crash === true);
-      this.traffic = this.mode !== 'private' || !r || !(r.traffic === 0 || r.traffic === false);
+      r = r || {}; const priv = this.mode === 'private';
+      this.crash = priv ? !(r.crash === 0 || r.crash === false) : true;
+      this.traffic = priv ? !(r.traffic === 0 || r.traffic === false) : true;
+      if (!priv) { this.track = null; this.skin = null; this.laps = cfg.laps; return; }
+      const tid = Sim.TRACK_IDS.includes(r.track) ? r.track : (this.track || 'classic'), info = Sim.trackInfo(tid);
+      this.track = tid;
+      this.skin = typeof r.skin === 'string' && info.skins.includes(r.skin) ? r.skin : 'auto';
+      const n = Math.round(+r.laps);
+      this.laps = Number.isFinite(n) && r.laps !== undefined && r.laps !== null ? Math.max(1, Math.min(10, n)) : info.laps;
     }
     get connected() { return this.players.filter((p) => p.connected && !p.left); }
     get humans() { return this.players.filter((p) => !p.bot); }
     broadcast(obj) { const s = JSON.stringify(obj); for (const p of this.players) if (p.connected && p.conn && !p.left) p.conn.send(s); }
     lobbyMsg() {
-      return { t: 'lobby', room: { id: this.id, code: this.code, mode: this.mode, variant: this.variant, crash: this.crash ? 1 : 0, traffic: this.traffic ? 1 : 0, practice: this.practice, offer: this.offer, status: this.status, min: cfg.minPlayers, max: cfg.maxPlayers, laps: cfg.laps,
+      return { t: 'lobby', room: { id: this.id, code: this.code, mode: this.mode, variant: this.variant, crash: this.crash ? 1 : 0, traffic: this.traffic ? 1 : 0, practice: this.practice, offer: this.offer, status: this.status, min: cfg.minPlayers, max: cfg.maxPlayers, laps: this.laps, track: this.track, skin: this.skin,
         startsIn: this.startAt ? Math.max(0, this.startAt - Date.now()) : null, host: this.host,
         players: this.players.filter((p) => !p.left).map((p) => ({ id: p.userId, name: p.name, level: p.level, car: p.car.id, carName: p.car.name, ready: p.ready, connected: p.connected, seat: p.seat, bot: p.bot ? 1 : 0, deco: p.deco || {} })) } };
     }
@@ -93,7 +112,7 @@ export function createGame(userCfg, supa, log = () => {}) {
       this.players = [...bots.slice(0, at), human, ...bots.slice(at)];
       this.players.forEach((p, i) => (p.seat = i));
       human.ready = true;
-      this.startAt = Date.now() + 2500; this.startTimer = later(2500, () => this.countdown());
+      this.startAt = Date.now() + 2500; this.startTimer = later(2500, () => this.startLoad());
       this.sendLobby(); stats.practice++; return true;
     }
     evaluate() {                                   // decides if/when the countdown begins
@@ -109,25 +128,61 @@ export function createGame(userCfg, supa, log = () => {}) {
         at = n >= cfg.maxPlayers ? Date.now() + cfg.fullStartDelayMs : this.minSince + cfg.minStartWaitMs;
         if (allReady) at = Math.min(at, Date.now() + cfg.readyStartDelayMs);
       } else if (allReady) at = Date.now() + cfg.readyStartDelayMs;
-      if (at !== Infinity) { this.startAt = at; this.startTimer = later(Math.max(0, at - Date.now()), () => this.countdown()); }
+      if (at !== Infinity) { this.startAt = at; this.startTimer = later(Math.max(0, at - Date.now()), () => this.startLoad()); }
       this.sendLobby();
     }
-    countdown() {
+    // step 1: everybody is told to LOAD (a splash with their car and tips). The server picks the track, skin and traffic seed now, so every racer builds the very same scene.
+    startLoad() {
       if (this.status !== 'lobby') return;
       if (this.connected.length < cfg.minPlayers) return this.evaluate();
-      this.status = 'countdown'; this.startAt = 0; this.offer = false; this.sendLobby();
+      this.status = 'loading'; this.startAt = 0; this.offer = false;
+      if (this.mode !== 'private') { this.track = Sim.TRACK_IDS.includes(cfg.forceTrack) ? cfg.forceTrack : Sim.TRACK_IDS[randomInt(Sim.TRACK_IDS.length)]; this.skin = null; this.laps = cfg.laps; }
+      const info = Sim.trackInfo(this.track);
+      this.runSkin = this.skin && this.skin !== 'auto' && info.skins.includes(this.skin) ? this.skin : info.skins[randomInt(info.skins.length)];
       this.seed = cfg.traffic ? randomInt(1, 2147483647) : 0;                          // one traffic pattern per race, the same for every driver
-      this.broadcast({ t: 'countdown', ms: cfg.countdownMs, seed: this.seed, variant: this.variant, crash: this.crash ? 1 : 0, traffic: this.traffic ? 1 : 0 });
-      this.startTimer = later(cfg.countdownMs, () => this.go());
+      for (const p of this.players) p.loaded = !!p.bot;
+      this.loadStart = Date.now();
+      this.sendLobby(); this.broadcast(this.loadMsg());
+      clearTimeout(this.loadMinTimer); clearTimeout(this.loadMaxTimer);
+      this.loadMinTimer = later(cfg.loadMinMs, () => this.loadCheck());
+      this.loadMaxTimer = later(cfg.loadMaxMs, () => this.loadTimeout());
     }
+    loadMsg() {
+      return { t: 'load', room: this.id, track: this.track, skin: this.runSkin, laps: this.laps, seed: this.seed || 0, variant: this.variant, crash: this.crash ? 1 : 0, traffic: this.traffic ? 1 : 0, practice: this.practice ? 1 : 0, minMs: cfg.loadMinMs, maxMs: cfg.loadMaxMs,
+        seats: this.players.map((p) => ({ seat: p.seat, id: p.userId, name: p.name, car: p.car.id, carName: p.car.name, deco: p.deco || {}, bot: p.bot ? 1 : 0 })) };
+    }
+    loadStatus() { const hum = this.connected.filter((p) => !p.bot); this.broadcast({ t: 'loadst', n: hum.filter((p) => p.loaded).length, of: hum.length }); }
+    onLoaded(p) { if (this.status !== 'loading' || p.loaded) return; p.loaded = true; this.loadStatus(); this.loadCheck(); }
+    // step 2: the race starts when every connected human has loaded AND the splash has been up long enough to read the tips
+    loadCheck() {
+      if (this.status !== 'loading') return;
+      if (this.connected.length < cfg.minPlayers) return;
+      if (Date.now() - this.loadStart < cfg.loadMinMs) return;
+      if (this.connected.some((p) => !p.bot && !p.loaded)) return;
+      this.beginCountdown();
+    }
+    loadTimeout() {                                                                       // somebody never finished loading: they miss this race, everybody else goes
+      if (this.status !== 'loading') return;
+      for (const p of this.players.slice()) if (!p.bot && p.connected && !p.loaded) { out(p.conn, { t: 'err', code: 'load_timeout' }); this.removePlayer(p.userId); }
+      if (this.status === 'loading') { if (this.connected.length >= cfg.minPlayers) this.beginCountdown(); else this.backToLobby(); }
+    }
+    backToLobby() { clearTimeout(this.loadMinTimer); clearTimeout(this.loadMaxTimer); clearTimeout(this.startTimer); this.status = 'lobby'; this.players.forEach((p) => { p.ready = !!p.bot; p.loaded = false; }); this.evaluate(); }
+    beginCountdown() {
+      if (this.status !== 'loading') return;
+      clearTimeout(this.loadMinTimer); clearTimeout(this.loadMaxTimer);
+      this.status = 'countdown'; this.countAt = Date.now(); this.sendLobby();
+      this.broadcast(this.countdownMsg());
+      this.startTimer = later(cfg.introMs + cfg.countdownMs, () => this.go());
+    }
+    countdownMsg() { const left = Math.max(0, cfg.introMs + cfg.countdownMs - (Date.now() - (this.countAt || Date.now()))); return { t: 'countdown', ms: left, intro: Math.min(cfg.introMs, left > cfg.countdownMs ? left - cfg.countdownMs : 0), seed: this.seed || 0, variant: this.variant, crash: this.crash ? 1 : 0, traffic: this.traffic ? 1 : 0, track: this.track, skin: this.runSkin, laps: this.laps }; }
     go() {
       if (this.status !== 'countdown') return;
-      if (this.connected.length < cfg.minPlayers) { this.status = 'lobby'; this.players.forEach((p) => (p.ready = !!p.bot)); return this.evaluate(); }
+      if (this.connected.length < cfg.minPlayers) { this.status = 'lobby'; this.players.forEach((p) => { p.ready = !!p.bot; p.loaded = false; }); return this.evaluate(); }
       for (const p of this.players) if (!p.connected) p.left = true;                      // someone vanished during the countdown
       this.players = this.players.filter((p) => !p.left); this.players.forEach((p, i) => (p.seat = i));
       this.status = 'racing'; stats.started++;
       if (this.seed == null) this.seed = cfg.traffic ? randomInt(1, 2147483647) : 0;
-      this.world = Sim.newRace(this.players.map((p) => ({ id: p.userId, meta: p.car.meta })), cfg.laps, this.seed, { power: this.variant === 'power', crash: this.crash, traffic: this.traffic });
+      this.world = Sim.newRace(this.players.map((p) => ({ id: p.userId, meta: p.car.meta })), this.laps, this.seed, { power: this.variant === 'power', crash: this.crash, traffic: this.traffic, track: this.track });
       this.startedAt = Date.now();
       for (const p of this.players) { p.q = []; p.nextIn = 0; p.ack = -1; p.lastIn = Sim.clampInput({}); p.qn = 0; p.qa = null; p.qs = new Set(); }
       this.broadcast(this.startMsg()); this.broadcast({ t: 'go' });
@@ -135,7 +190,7 @@ export function createGame(userCfg, supa, log = () => {}) {
       log('race_start', { room: this.id, mode: this.mode, variant: this.variant, practice: this.practice, players: this.players.length });
     }
     startMsg() {
-      return { t: 'start', room: this.id, laps: cfg.laps, hz: Sim.HZ, seed: this.seed || 0, variant: this.variant, crash: this.crash ? 1 : 0, traffic: this.traffic ? 1 : 0, practice: this.practice ? 1 : 0,
+      return { t: 'start', room: this.id, laps: this.laps, track: this.track, skin: this.runSkin, hz: Sim.HZ, seed: this.seed || 0, variant: this.variant, crash: this.crash ? 1 : 0, traffic: this.traffic ? 1 : 0, practice: this.practice ? 1 : 0,
         seats: this.players.map((p) => ({ seat: p.seat, id: p.userId, name: p.name, level: p.level, car: p.car.id, carName: p.car.name, stats: p.car.meta, deco: p.deco, bot: p.bot ? 1 : 0 })) };
     }
     tickLoop() {
@@ -159,11 +214,12 @@ export function createGame(userCfg, supa, log = () => {}) {
       Sim.stepWorld(w, inputs);
       if (this.variant === 'quiz') this.quizTick(now);
       if (w.ev.length) {                                                                                    // power-up news: who picked what up, who zapped whom
-        this.broadcast({ t: 'fx', e: w.ev.map((x) => (x.k === 'zap' ? ['z', x.seat, x.to, x.blocked] : x.k === 'crash' ? ['c', x.a, x.b, x.f] : [x.k === 'get' ? 'g' : 'u', x.seat, x.it])) }); w.ev.length = 0;
+        this.broadcast({ t: 'fx', e: w.ev.map(fxOf) }); w.ev.length = 0;
       }
       {
-        const cars = JSON.stringify(w.cars.map((c, i) => [i, r1(c.x), r1(c.y), Math.round(c.h * 1000) / 1000, r1(c.v), c.P, Math.round(c.nit), c.fin ? 1 : 0, c.hits, c.it, c.tb, c.sh, c.sl]));
-        for (const p of this.players) if (!p.bot && p.connected && p.conn && !p.left) p.conn.send('{"t":"s","k":' + w.tick + ',"a":' + p.ack + ',"g":' + (w.cars[p.seat].got | 0) + ',"c":' + cars + '}');
+        // every car: [seat, x, y, heading, speed, gates, nitro, finished, hits, item, turbo, shield, zapped, slip angle, flags, air ticks left, air ticks total]  (flags: 1 drifting, 2 airborne, 4 spinning out, 8 drift/landing boost, 16 recovering, 32 slipstream, 64 nitro on)
+        const cars = JSON.stringify(w.cars.map((c, i) => [i, r1(c.x), r1(c.y), Math.round(c.h * 1000) / 1000, r1(c.v), c.P, Math.round(c.nit), c.fin ? 1 : 0, c.hits, c.it, c.tb, c.sh, c.sl, Math.round(c.sa * 100) / 100, flagsOf(c), c.ai, c.at]));
+        for (const p of this.players) if (!p.bot && p.connected && p.conn && !p.left) { const c = w.cars[p.seat]; p.conn.send('{"t":"s","k":' + w.tick + ',"a":' + p.ack + ',"g":' + (c.got | 0) + ',"o":[' + [c.df, c.dc, c.mt, c.ai, c.at, c.rc, c.gh, c.so, c.dd].join(',') + '],"c":' + cars + '}'); }
       }
       const finished = w.cars.filter((c) => c.fin).length;
       if (finished && !this.firstFinishAt) this.firstFinishAt = now;
@@ -174,7 +230,7 @@ export function createGame(userCfg, supa, log = () => {}) {
     }
     /* ---- quiz race: passing a gate pops up a road-sign question; the right answer is a short turbo, a wrong one a short slow-down ---- */
     quizTick(now) {
-      const w = this.world, K = Sim.K, gates = cfg.quizGates, total = cfg.laps * gates.length;
+      const w = this.world, K = w.tr.K, gates = cfg.quizGates, total = this.laps * gates.length;
       for (const p of this.players) {
         const c = w.cars[p.seat];
         if (p.qa) {
@@ -201,26 +257,41 @@ export function createGame(userCfg, supa, log = () => {}) {
       else { c.sl = Math.max(c.sl, 45); }
       if (!p.bot) out(p.conn, { t: 'qr', g: qa.g, ok: ok ? 1 : 0, a: right });
     }
+    // The winner of a QUICK MATCH with at least one other real person gets a loot box. Private rooms and bot practice never do (nothing to farm). The database refuses more than a few a day.
+    async lootFor(rows) {
+      const got = new Map();
+      if (this.practice || this.mode !== 'public') return got;
+      const humans = rows.filter((r) => !r.bot), win = rows[0];
+      if (humans.length < 2 || !win || win.bot || win.dnf) return got;
+      for (let a = 0; a < 2; a++) {
+        try { const r = await supa.rpc('k54_svc_race_loot', { p_room: this.id, p_user: win.user, p_tier: 'winner', p_humans: humans.length, p_cap: cfg.lootDailyCap }); if (r?.ok && r.box) got.set(win.user, { id: r.box.id, tier: r.box.tier }); break; }
+        catch (e) { log('loot_error', { room: this.id, err: String(e.message || e) }); await new Promise((res) => setTimeout(res, 300)); }
+      }
+      return got;
+    }
     async finish() {
       if (this.status !== 'racing') return;
       this.status = 'finished'; clearTimeout(this.loop);
       const w = this.world, ranked = Sim.ranking(w);
       const rows = ranked.map((c, i) => { const p = this.players.find((x) => x.userId === c.id); return {
         user: c.id, seat: p.seat, car: p.car.id, position: i + 1, finish_ms: c.fin ? Math.round(c.fin * Sim.DT * 1000) : null, dnf: !c.fin, collisions: c.hits,
-        best_lap_ms: c.best ? Math.round(c.best * 1000) : null, forfeit: !c.fin && (p.left || !p.connected), name: p.name, bot: p.bot ? 1 : 0 }; });
+        best_lap_ms: c.best ? Math.round(c.best * 1000) : null, forfeit: !c.fin && (p.left || !p.connected), name: p.name, bot: p.bot ? 1 : 0,
+        st: { drift: Math.round(c.sD * Sim.DT * 10) / 10, air: Math.round(c.sA * Sim.DT * 10) / 10, jumps: c.sJ, takedowns: c.sT, clean: c.sC } }; });
+      const awards = awardsOf(rows);
       let rewards = null;
       if (this.practice) rewards = [];                                                                       // practice races pay nothing and are not saved
       for (let a = 0; a < cfg.commitRetries && !rewards; a++) {
         try {
-          const r = await supa.rpc('k54_svc_race_commit', { p_room: this.id, p_meta: { mode: this.mode, code: this.code, track_id: 'loop-1' + (this.variant === 'normal' ? '' : '-' + this.variant) + (this.crash ? '-crash' : '') + (this.traffic ? '' : '-notraffic'), laps: cfg.laps, started_at: new Date(this.startedAt).toISOString(), finished_at: new Date().toISOString() },
-                                                         p_results: rows.map(({ name, bot, ...r }) => r) });
+          const r = await supa.rpc('k54_svc_race_commit', { p_room: this.id, p_meta: { mode: this.mode, code: this.code, track_id: this.track + (this.variant === 'normal' ? '' : '-' + this.variant) + (this.crash ? '' : '-nocrash') + (this.traffic ? '' : '-notraffic'), laps: this.laps, started_at: new Date(this.startedAt).toISOString(), finished_at: new Date().toISOString() },
+                                                         p_results: rows.map(({ name, bot, st, ...r }) => r) });
           if (r?.ok) rewards = r.duplicate ? [] : r.rewards; else throw new Error(r?.error || 'commit_failed');
         } catch (e) { stats.commitFailures++; log('commit_error', { room: this.id, err: String(e.message || e) }); await new Promise((res) => setTimeout(res, 400 * (a + 1))); }
       }
       stats.finished++;
       const byUser = new Map((rewards || []).map((x) => [x.user, x]));
-      const msg = { t: 'results', room: this.id, rewards_pending: rewards === null, practice: this.practice ? 1 : 0, variant: this.variant,
-        rows: rows.map((r) => ({ id: r.user, seat: r.seat, name: r.name, bot: r.bot, pos: r.position, ms: r.finish_ms, dnf: r.dnf, best: r.best_lap_ms, hits: r.collisions, coins: byUser.get(r.user)?.coins ?? 0, xp: byUser.get(r.user)?.xp ?? 0 })) };
+      const loot = await this.lootFor(rows);                                                                 // the winner of a quick match with other people in it gets a loot box (see lootFor)
+      const msg = { t: 'results', room: this.id, rewards_pending: rewards === null, practice: this.practice ? 1 : 0, variant: this.variant, track: this.track, skin: this.runSkin, laps: this.laps, awards,
+        rows: rows.map((r) => ({ id: r.user, seat: r.seat, name: r.name, bot: r.bot, pos: r.position, ms: r.finish_ms, dnf: r.dnf, best: r.best_lap_ms, hits: r.collisions, coins: byUser.get(r.user)?.coins ?? 0, xp: byUser.get(r.user)?.xp ?? 0, st: r.st, loot: loot.get(r.user) || null })) };
       this.broadcast(msg); this.resultMsg = msg;
       for (const p of this.players) { if (userRoom.get(p.userId) === this) userRoom.delete(p.userId); }
       log('race_end', { room: this.id, practice: this.practice, rewards: rewards === null ? 'pending' : 'ok' });
@@ -233,11 +304,15 @@ export function createGame(userCfg, supa, log = () => {}) {
       this.players = this.players.filter((x) => x !== p); this.players.forEach((x, i) => (x.seat = i));
       if (this.host === userId) this.host = this.humans[0]?.userId || null;
       if (!this.humans.length) return this.destroy();                                   // (a practice room dies with its human)
-      if (this.status === 'countdown' && this.connected.length < cfg.minPlayers) { clearTimeout(this.startTimer); this.status = 'lobby'; this.players.forEach((x) => (x.ready = false)); }
+      if (this.status === 'countdown' || this.status === 'loading') {                  // somebody left while the race was loading / counting down
+        if (this.connected.length < cfg.minPlayers) { this.players.forEach((x) => { if (!x.bot) x.ready = false; }); return this.backToLobby(); }
+        if (this.status === 'loading') this.loadCheck();
+        return this.sendLobby();
+      }
       this.evaluate();
     }
     destroy() {
-      clearTimeout(this.startTimer); clearTimeout(this.loop); clearTimeout(this.soloTimer); clearTimeout(this.offerTimer); rooms.delete(this.id); if (this.code) codes.delete(this.code);
+      clearTimeout(this.startTimer); clearTimeout(this.loop); clearTimeout(this.soloTimer); clearTimeout(this.offerTimer); clearTimeout(this.loadMinTimer); clearTimeout(this.loadMaxTimer); rooms.delete(this.id); if (this.code) codes.delete(this.code);
       if (openPublic.get(this.variant) === this) openPublic.delete(this.variant);
       for (const p of this.players) if (userRoom.get(p.userId) === this) userRoom.delete(p.userId);
     }
@@ -271,6 +346,7 @@ export function createGame(userCfg, supa, log = () => {}) {
     if (m.t === 'qa') return onQuizAnswer(s, m);
     if (m.t === 'hello') return onHello(s, m);
     if (!s.authed) return;
+    if (m.t === 'loaded') { const r = s.room, p = s.player; if (r && p) r.onLoaded(p); return; }
     if (DUEL_MSGS.has(m.t)) return duels.handle(s, m).catch((e) => { log('duel_error', { t: m.t, err: String(e.message || e) }); s.dbusy = false; s.err('server_error'); });
     if (s.busy) return s.err('busy');                                   // one lobby action at a time per connection
     s.busy = true;
@@ -279,6 +355,7 @@ export function createGame(userCfg, supa, log = () => {}) {
 
   async function onHello(s, m) {
     if (s.authed || s.helloing) return;
+    if (!(+m.pv >= PROTOCOL)) { s.err('old_client', { need: PROTOCOL }); return s.conn.close(4004, 'old_client'); }      // a client from before the loading step cannot take part (it would wait for a countdown that never comes)
     s.helloing = true;
     let user;
     try { user = await supa.getUser(m.token); } catch { return s.fail('auth_unavailable'); }
@@ -295,7 +372,10 @@ export function createGame(userCfg, supa, log = () => {}) {
         p.connected = true; p.conn = s.conn; clearTimeout(p.dcTimer);
         s.send({ t: 'resume', status: room.status });
         if (room.status === 'racing') { s.send(room.startMsg()); p.q = []; p.nextIn = 0; p.ack = -1; s.send({ t: 'go' }); }
-        else s.send(room.lobbyMsg());
+        else {
+          s.send(room.lobbyMsg());
+          if (room.status === 'loading' || room.status === 'countdown') { p.loaded = false; s.send(room.loadMsg()); if (room.status === 'countdown') s.send(room.countdownMsg()); }
+        }
         if (room.status === 'lobby') room.evaluate();
       }
     }
@@ -322,7 +402,7 @@ export function createGame(userCfg, supa, log = () => {}) {
         if (rooms.size >= cfg.maxRooms) return s.err('server_busy');
         const e = await enter(s, m.car); if (!e) return;
         const code = newCode(); if (!code) return s.err('server_busy');
-        const r = new Room('private', pickVariant(m.mode), { crash: m.crash, traffic: m.traffic }); r.code = code; codes.set(code, r); rooms.set(r.id, r);
+        const r = new Room('private', pickVariant(m.mode), { crash: m.crash, traffic: m.traffic, track: m.track, skin: m.skin, laps: m.laps }); r.code = code; codes.set(code, r); rooms.set(r.id, r);
         r.add(mkPlayer(s, e)); userRoom.set(s.user.id, r); r.evaluate(); return;
       }
       case 'join': {
@@ -346,7 +426,9 @@ export function createGame(userCfg, supa, log = () => {}) {
       }
       case 'opts': {                                                          // the host of a private room changes the house rules (crashes, traffic) while everybody is still in the lobby
         if (!room || !p || room.mode !== 'private' || room.status !== 'lobby' || room.host !== s.user.id) return s.err('not_in_lobby');
-        room.setRules({ crash: m.crash === undefined ? room.crash : m.crash, traffic: m.traffic === undefined ? room.traffic : m.traffic });
+        const newTrack = m.track !== undefined && m.track !== room.track;                 // a new track brings its own skins and its own lap count unless the host says otherwise
+        room.setRules({ crash: m.crash === undefined ? room.crash : m.crash, traffic: m.traffic === undefined ? room.traffic : m.traffic, track: m.track === undefined ? room.track : m.track,
+          skin: m.skin !== undefined ? m.skin : (newTrack ? 'auto' : room.skin), laps: m.laps !== undefined ? m.laps : (newTrack ? undefined : room.laps) });
         for (const q of room.players) if (!q.bot) q.ready = false;            // new rules: everybody confirms again
         room.sendLobby(); room.evaluate(); return;
       }
@@ -406,9 +488,9 @@ export function createGame(userCfg, supa, log = () => {}) {
       const room = userRoom.get(s.user.id); const p = room?.players.find((x) => x.userId === s.user.id);
       if (!room || !p) return;
       p.connected = false; p.dcAt = Date.now();
-      if (room.status === 'lobby' || room.status === 'countdown') {
+      if (room.status === 'lobby' || room.status === 'countdown' || room.status === 'loading') {
         p.dcTimer = later(cfg.lobbyGraceMs, () => { if (!p.connected) room.removePlayer(p.userId); });
-        room.evaluate();
+        if (room.status === 'loading') room.loadCheck(); else room.evaluate();
       }
     };
   }
