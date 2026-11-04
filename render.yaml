@@ -5,6 +5,7 @@ services:
     runtime: docker
     dockerfilePath: ./Dockerfile
     plan: free
+    region: frankfurt                # the Render region closest to South Africa (Oregon is the far-away default); a service's region cannot be changed later
     healthCheckPath: /health
     numInstances: 1
     envVars:

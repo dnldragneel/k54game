@@ -9,7 +9,7 @@ const QUIZ = req('../shared/quiz-bank.json');                        // { id: in
 
 export const DEFAULTS = {
   laps: 3, minPlayers: 2, maxPlayers: 10, countdownMs: 5600, introMs: 4200, loadMinMs: 4500, loadMaxMs: 22000, fullStartDelayMs: 3000, minStartWaitMs: 15000, readyStartDelayMs: 1500,
-  finishTimeoutMs: 25000, lootDailyCap: 5, graceMs: 15000, lobbyGraceMs: 10000, soloWaitMs: 90000, resultsKeepMs: 60000, helloTimeoutMs: 5000, maxRooms: 300, commitRetries: 3,
+  finishTimeoutMs: 25000, lootDailyCap: 5, graceMs: 15000, lobbyGraceMs: 10000, awayMs: 90000, snapLagTicks: 24, soloWaitMs: 90000, resultsKeepMs: 60000, helloTimeoutMs: 5000, maxRooms: 300, commitRetries: 3,
   traffic: true, reactGapMs: 600,
   botOfferMs: 30000, botCount: 5, practiceEndMs: 6000,                // alone in the queue for this long -> offer a practice race against bots; how many bots; how long after the human finishes the practice race closes
   quizAnswerMs: 7000, quizGates: [4, 9, 14],                          // quiz race: time to answer, and the checkpoints (of 16) where a question pops up each lap
@@ -17,7 +17,7 @@ export const DEFAULTS = {
 export const VARIANTS = ['normal', 'power'];                         // the two race modes: a normal race and a race with power-ups (the sign-quiz race was removed; an old app that asks for it gets a normal race)
 // the only reactions a player can send (no free text, so nothing to moderate): the app maps each to its emoji
 // 8 = four tracks + skins (lobby / load / start carry track, skin, laps), crashes on by default, drifting (input 'dr'), ramps, a LOADING step before the countdown (server 'load' -> every driver answers 'loaded'; the race starts when all have), an intro before the countdown, richer news and results (awards, loot box). Clients must say hello with pv >= 8.
-export const PROTOCOL = 8;                                          // 7 = 1v1 duels (dqueue / dask / dend ...; see duel.mjs) and races pay no coins; 6 = private rooms can switch crashes and traffic on/off (lobby / countdown / start carry crash + traffic, 'opts' message, 'c' crash news); 5 = up to ten racers, three race modes, bot practice, brake reverses
+export const PROTOCOL = 9;                                          // 9 = a private room stays open after a race (everybody goes back to the same lobby, 'again'), the host can hand the room over ('host'), 1v1 rematch + private duels; 8 = four tracks + skins (see above); 7 = 1v1 duels (dqueue / dask / dend ...; see duel.mjs) and races pay no coins; 6 = private rooms can switch crashes and traffic on/off (lobby / countdown / start carry crash + traffic, 'opts' message, 'c' crash news); 5 = up to ten racers, three race modes, bot practice, brake reverses
 export const REACTIONS = ['laugh', 'smile', 'cool', 'thumbs', 'cry'];
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const r1 = (n) => Math.round(n * 10) / 10;
@@ -50,10 +50,12 @@ export function createGame(userCfg, supa, log = () => {}) {
   const timers = new Set();
   const openPublic = new Map();                                       // race mode -> the public room of that mode that is still filling up
   const later = (ms, fn) => { const t = setTimeout(() => { timers.delete(t); fn(); }, ms); timers.add(t); return t; };
-  const stats = { started: 0, finished: 0, commitFailures: 0, reactions: 0, practice: 0 };
+  const stats = { started: 0, finished: 0, commitFailures: 0, reactions: 0, practice: 0, snapThinned: 0 };
+  // how well the 30-per-second race loop keeps time (shown in /health): how late a tick starts, and how long one tick takes. A server that is starved of CPU (a free host) shows up here as slow-motion racing.
+  const clock = { ticks: 0, lateAvg: 0, lateMax: 0, stepAvg: 0, stepMax: 0, behind: 0 };
 
   const out = (conn, obj) => conn && !conn.closed && conn.send(JSON.stringify(obj));
-  const duels = createDuels(cfg.duel || {}, supa, log, { later, out, inRace: (id) => userRoom.has(id) });
+  const duels = createDuels(cfg.duel || {}, supa, log, { later, out, inRace: (id) => userRoom.has(id), sess: (id) => sessions.get(id) });
 
   class Room {
     constructor(mode, variant, rules) {
@@ -74,13 +76,14 @@ export function createGame(userCfg, supa, log = () => {}) {
       const n = Math.round(+r.laps);
       this.laps = Number.isFinite(n) && r.laps !== undefined && r.laps !== null ? Math.max(1, Math.min(10, n)) : info.laps;
     }
+    comeBack(p) { if (p.away) { p.away = false; clearTimeout(p.awayTimer); } }
     get connected() { return this.players.filter((p) => p.connected && !p.left); }
     get humans() { return this.players.filter((p) => !p.bot); }
     broadcast(obj) { const s = JSON.stringify(obj); for (const p of this.players) if (p.connected && p.conn && !p.left) p.conn.send(s); }
     lobbyMsg() {
       return { t: 'lobby', room: { id: this.id, code: this.code, mode: this.mode, variant: this.variant, crash: this.crash ? 1 : 0, traffic: this.traffic ? 1 : 0, practice: this.practice, offer: this.offer, status: this.status, min: cfg.minPlayers, max: cfg.maxPlayers, laps: this.laps, track: this.track, skin: this.skin,
         startsIn: this.startAt ? Math.max(0, this.startAt - Date.now()) : null, host: this.host,
-        players: this.players.filter((p) => !p.left).map((p) => ({ id: p.userId, name: p.name, level: p.level, car: p.car.id, carName: p.car.name, ready: p.ready, connected: p.connected, seat: p.seat, bot: p.bot ? 1 : 0, deco: p.deco || {} })) } };
+        players: this.players.filter((p) => !p.left).map((p) => ({ id: p.userId, name: p.name, level: p.level, car: p.car.id, carName: p.car.name, ready: p.ready, connected: p.connected, away: p.away ? 1 : 0, seat: p.seat, bot: p.bot ? 1 : 0, deco: p.deco || {} })) } };
     }
     sendLobby() { this.broadcast(this.lobbyMsg()); }
     add(p) { p.seat = this.players.length; this.players.push(p); if (!this.host) this.host = p.userId; if (this.connected.length >= cfg.minPlayers && !this.minSince) this.minSince = Date.now(); this.armSolo(); }
@@ -184,7 +187,7 @@ export function createGame(userCfg, supa, log = () => {}) {
       if (this.seed == null) this.seed = cfg.traffic ? randomInt(1, 2147483647) : 0;
       this.world = Sim.newRace(this.players.map((p) => ({ id: p.userId, meta: p.car.meta })), this.laps, this.seed, { power: this.variant === 'power', crash: this.crash, traffic: this.traffic, track: this.track });
       this.startedAt = Date.now();
-      for (const p of this.players) { p.q = []; p.nextIn = 0; p.ack = -1; p.lastIn = Sim.clampInput({}); p.qn = 0; p.qa = null; p.qs = new Set(); }
+      for (const p of this.players) { p.q = []; p.nextIn = 0; p.ack = -1; p.lastIn = Sim.clampInput({}); p.qn = 0; p.qa = null; p.qs = new Set(); p.nStarved = 0; p.nDropped = 0; p.nTicks = 0; p.maxQ = 0; p.seen = null; p.nThin = 0; }
       this.broadcast(this.startMsg()); this.broadcast({ t: 'go' });
       this.t0 = performance.now(); this.n = 0; this.loop = setTimeout(() => this.tickLoop(), 0);
       log('race_start', { room: this.id, mode: this.mode, variant: this.variant, practice: this.practice, players: this.players.length });
@@ -197,7 +200,16 @@ export function createGame(userCfg, supa, log = () => {}) {
       if (this.status !== 'racing') return;
       const dtMs = Sim.DT * 1000;
       let guard = 0;
-      while (guard++ < 4 && performance.now() - this.t0 >= this.n * dtMs) { this.n++; this.step(); if (this.status !== 'racing') return; }
+      {
+        const late = Math.max(0, performance.now() - (this.t0 + this.n * dtMs));
+        clock.lateAvg += (late - clock.lateAvg) * 0.02; if (late > clock.lateMax) clock.lateMax = late;
+        if (late > dtMs) clock.behind++;
+      }
+      while (guard++ < 4 && performance.now() - this.t0 >= this.n * dtMs) {
+        const s0 = performance.now(); this.n++; this.step(); clock.ticks++;
+        const took = performance.now() - s0; clock.stepAvg += (took - clock.stepAvg) * 0.02; if (took > clock.stepMax) clock.stepMax = took;
+        if (this.status !== 'racing') return;
+      }
       const next = this.t0 + this.n * dtMs - performance.now();
       this.loop = setTimeout(() => this.tickLoop(), Math.max(1, next));
     }
@@ -207,8 +219,8 @@ export function createGame(userCfg, supa, log = () => {}) {
         let inp;
         if (p.bot) inp = Sim.botInput(w, w.cars[p.seat], p.bot);
         else if (p.left || (!p.connected && now - p.dcAt > 1000)) inp = Sim.clampInput({});                       // abandoned: coast
-        else if (p.q.length) { const e = p.q.shift(); p.ack = e.idx; p.lastIn = e.inp; inp = e.inp; }
-        else inp = p.lastIn;                                                                                // starved: repeat last input
+        else if (p.q.length) { const e = p.q.shift(); p.ack = e.idx; p.lastIn = e.inp; inp = e.inp; p.nTicks++; }
+        else { inp = p.lastIn; p.nStarved++; p.nTicks++; }                                                                                // starved: repeat last input
         inputs[p.userId] = inp;
       }
       Sim.stepWorld(w, inputs);
@@ -219,7 +231,10 @@ export function createGame(userCfg, supa, log = () => {}) {
       {
         // every car: [seat, x, y, heading, speed, gates, nitro, finished, hits, item, turbo, shield, zapped, slip angle, flags, air ticks left, air ticks total]  (flags: 1 drifting, 2 airborne, 4 spinning out, 8 drift/landing boost, 16 recovering, 32 slipstream, 64 nitro on)
         const cars = JSON.stringify(w.cars.map((c, i) => [i, r1(c.x), r1(c.y), Math.round(c.h * 1000) / 1000, r1(c.v), c.P, Math.round(c.nit), c.fin ? 1 : 0, c.hits, c.it, c.tb, c.sh, c.sl, Math.round(c.sa * 100) / 100, flagsOf(c), c.ai, c.at]));
-        for (const p of this.players) if (!p.bot && p.connected && p.conn && !p.left) { const c = w.cars[p.seat]; p.conn.send('{"t":"s","k":' + w.tick + ',"a":' + p.ack + ',"g":' + (c.got | 0) + ',"o":[' + [c.df, c.dc, c.mt, c.ai, c.at, c.rc, c.gh, c.so, c.dd].join(',') + '],"c":' + cars + '}'); }
+        for (const p of this.players) if (!p.bot && p.connected && p.conn && !p.left) {
+          // a client that confirms (in its inputs) the newest snapshot it has seen: far behind = a congested link, where every extra packet only makes the queue longer. Send it a third of the snapshots until it catches up.
+          if (p.seen != null && w.tick - p.seen > cfg.snapLagTicks && w.tick % 3) { p.nThin++; stats.snapThinned++; continue; }
+          const c = w.cars[p.seat]; p.conn.send('{"t":"s","k":' + w.tick + ',"a":' + p.ack + ',"g":' + (c.got | 0) + ',"o":[' + [c.df, c.dc, c.mt, c.ai, c.at, c.rc, c.gh, c.so, c.dd].join(',') + '],"c":' + cars + '}'); }
       }
       const finished = w.cars.filter((c) => c.fin).length;
       if (finished && !this.firstFinishAt) this.firstFinishAt = now;
@@ -290,16 +305,33 @@ export function createGame(userCfg, supa, log = () => {}) {
       stats.finished++;
       const byUser = new Map((rewards || []).map((x) => [x.user, x]));
       const loot = await this.lootFor(rows);                                                                 // the winner of a quick match with other people in it gets a loot box (see lootFor)
-      const msg = { t: 'results', room: this.id, rewards_pending: rewards === null, practice: this.practice ? 1 : 0, variant: this.variant, track: this.track, skin: this.runSkin, laps: this.laps, awards,
+      const msg = { t: 'results', room: this.id, priv: this.mode === 'private' && !this.practice ? 1 : 0, rewards_pending: rewards === null, practice: this.practice ? 1 : 0, variant: this.variant, track: this.track, skin: this.runSkin, laps: this.laps, awards,
         rows: rows.map((r) => ({ id: r.user, seat: r.seat, name: r.name, bot: r.bot, pos: r.position, ms: r.finish_ms, dnf: r.dnf, best: r.best_lap_ms, hits: r.collisions, coins: byUser.get(r.user)?.coins ?? 0, xp: byUser.get(r.user)?.xp ?? 0, st: r.st, loot: loot.get(r.user) || null })) };
       this.broadcast(msg); this.resultMsg = msg;
+      log('race_end', { room: this.id, practice: this.practice, rewards: rewards === null ? 'pending' : 'ok', net: this.players.filter((p) => !p.bot).map((p) => ({ seat: p.seat, ticks: p.nTicks, starved: p.nStarved, dropped: p.nDropped, maxQ: p.maxQ, thinned: p.nThin | 0 })) });
+      if (this.mode === 'private' && !this.practice) return this.recycle();                              // a private room lives on: same code, same people, back to the lobby
       for (const p of this.players) { if (userRoom.get(p.userId) === this) userRoom.delete(p.userId); }
-      log('race_end', { room: this.id, practice: this.practice, rewards: rewards === null ? 'pending' : 'ok' });
       later(cfg.resultsKeepMs, () => this.destroy());
+    }
+    /* after a private-room race: everybody who is still here stays in the SAME room (same code, same rules, same leader) and is back in its lobby, not ready. Players who are still looking at their results are marked "away"
+       until they press BACK TO ROOM (or for awayMs, then they are dropped so they cannot hold the others up). */
+    recycle() {
+      for (const p of this.players) if (p.left && userRoom.get(p.userId) === this) userRoom.delete(p.userId);
+      this.players = this.players.filter((p) => !p.left);
+      if (!this.players.some((p) => p.userId === this.host)) this.host = this.humans[0]?.userId || null;
+      if (!this.humans.length) return this.destroy();
+      this.players.forEach((p, i) => {
+        p.seat = i; p.ready = false; p.loaded = false; p.away = true; p.q = []; p.qa = null; p.qn = 0; clearTimeout(p.awayTimer); clearTimeout(p.dcTimer);
+        p.awayTimer = later(cfg.awayMs, () => { if (p.away && !this.destroyed) this.removePlayer(p.userId, 'away'); });
+        if (!p.connected) p.dcTimer = later(cfg.lobbyGraceMs, () => { if (!p.connected) this.removePlayer(p.userId); });
+      });
+      this.world = null; this.status = 'lobby'; this.startAt = 0; this.minSince = 0; this.firstFinishAt = 0; this.humanDoneAt = 0; this.runSkin = null; this.countAt = 0;
+      this.evaluate();
     }
     removePlayer(userId, why) {
       const p = this.players.find((x) => x.userId === userId); if (!p) return;
       if (userRoom.get(userId) === this) userRoom.delete(userId);
+      clearTimeout(p.awayTimer); clearTimeout(p.dcTimer);
       if (this.status === 'racing' || this.status === 'finished') { p.left = true; p.ready = false; return; }
       this.players = this.players.filter((x) => x !== p); this.players.forEach((x, i) => (x.seat = i));
       if (this.host === userId) this.host = this.humans[0]?.userId || null;
@@ -312,6 +344,7 @@ export function createGame(userCfg, supa, log = () => {}) {
       this.evaluate();
     }
     destroy() {
+      this.destroyed = true; for (const p of this.players) { clearTimeout(p.awayTimer); clearTimeout(p.dcTimer); }
       clearTimeout(this.startTimer); clearTimeout(this.loop); clearTimeout(this.soloTimer); clearTimeout(this.offerTimer); clearTimeout(this.loadMinTimer); clearTimeout(this.loadMaxTimer); rooms.delete(this.id); if (this.code) codes.delete(this.code);
       if (openPublic.get(this.variant) === this) openPublic.delete(this.variant);
       for (const p of this.players) if (userRoom.get(p.userId) === this) userRoom.delete(p.userId);
@@ -418,11 +451,22 @@ export function createGame(userCfg, supa, log = () => {}) {
       case 'car': {
         if (!room || room.status !== 'lobby' || !p) return s.err('not_in_lobby');
         const e = await enter(s, m.car); if (!e) return;
-        p.car = { id: e.car.id, name: e.car.name, meta: e.car.meta }; p.deco = e.deco || {}; p.ready = false; room.sendLobby(); return;
+        p.car = { id: e.car.id, name: e.car.name, meta: e.car.meta }; p.deco = e.deco || {}; p.ready = false; room.comeBack(p); room.sendLobby(); return;
       }
       case 'ready': {
         if (!room || room.status !== 'lobby' || !p) return s.err('not_in_lobby');
-        p.ready = !!m.on; room.evaluate(); return;
+        room.comeBack(p); p.ready = !!m.on; room.evaluate(); return;
+      }
+      case 'again': {                                                         // BACK TO ROOM on the results screen of a private room
+        if (!room || !p || room.status !== 'lobby') return s.err('room_gone');
+        if (p.away) { room.comeBack(p); room.sendLobby(); } else s.send(room.lobbyMsg());
+        return;
+      }
+      case 'host': {                                                          // the leader of a private room hands the room over to another real player in it
+        if (!room || !p || room.mode !== 'private' || room.status !== 'lobby' || room.host !== s.user.id) return s.err('not_in_lobby');
+        const t = room.players.find((x) => x.userId === m.to && !x.bot && !x.left);
+        if (!t || t.userId === s.user.id || !t.connected) return s.err('bad_target');
+        room.host = t.userId; log('host_change', { room: room.id, to: t.userId }); room.sendLobby(); return;
       }
       case 'opts': {                                                          // the host of a private room changes the house rules (crashes, traffic) while everybody is still in the lobby
         if (!room || !p || room.mode !== 'private' || room.status !== 'lobby' || room.host !== s.user.id) return s.err('not_in_lobby');
@@ -462,8 +506,10 @@ export function createGame(userCfg, supa, log = () => {}) {
     if (n < p.nextIn) return;                                            // duplicate / old
     if (n - p.nextIn > 12) p.nextIn = n;                                 // big gap: resynchronise
     while (p.nextIn < n) { p.q.push({ idx: p.nextIn++, inp: p.lastQ }); }   // short gap: repeat the last input
+    if (Number.isInteger(m.s) && m.s > 0) p.seen = m.s;                    // the newest snapshot tick this driver has received (optional field)
     const inp = Sim.clampInput(m); p.lastQ = inp; p.q.push({ idx: n, inp }); p.nextIn = n + 1;
-    if (p.q.length > 6) { const drop = p.q.splice(0, p.q.length - 6); p.ack = drop[drop.length - 1].idx; }   // client running ahead: skip old inputs
+    if (p.q.length > p.maxQ) p.maxQ = p.q.length;
+    if (p.q.length > 6) { const drop = p.q.splice(0, p.q.length - 6); p.ack = drop[drop.length - 1].idx; p.nDropped += drop.length; }   // client running ahead: skip old inputs
   }
 
   // a quick emoji from a driver, shown to everyone in the race above that car and in the live feed (whitelisted, rate limited)
@@ -497,7 +543,8 @@ export function createGame(userCfg, supa, log = () => {}) {
 
   return {
     onConnection, cfg, stats, duels, debug: { rooms },
-    snapshot() { let lobby = 0, racing = 0; for (const r of rooms.values()) { if (r.status === 'racing') racing++; else if (r.status === 'lobby' || r.status === 'countdown') lobby++; } return { sessions: sessions.size, rooms: rooms.size, lobby, racing, ...stats, ...duels.snapshot() }; },
+    snapshot() { let lobby = 0, racing = 0; for (const r of rooms.values()) { if (r.status === 'racing') racing++; else if (r.status === 'lobby' || r.status === 'countdown') lobby++; } const tick = { ticks: clock.ticks, lateAvgMs: r1(clock.lateAvg), lateMaxMs: r1(clock.lateMax), stepAvgMs: r1(clock.stepAvg), stepMaxMs: r1(clock.stepMax), ticksBehind: clock.behind, budgetMs: r1(Sim.DT * 1000) }; clock.lateMax = 0; clock.stepMax = 0;   // the maxima are "since the last look"
+      return { sessions: sessions.size, rooms: rooms.size, lobby, racing, ...stats, tick, ...duels.snapshot() }; },
     stop() { duels.stop(); for (const t of timers) clearTimeout(t); for (const r of rooms.values()) { clearTimeout(r.startTimer); clearTimeout(r.loop); clearTimeout(r.soloTimer); clearTimeout(r.offerTimer); } },
   };
 }
