@@ -160,7 +160,8 @@ export function createGame(userCfg, supa, log = () => {}) {
     loadCheck() {
       if (this.status !== 'loading') return;
       if (this.connected.length < cfg.minPlayers) return;
-      if (Date.now() - this.loadStart < cfg.loadMinMs) return;
+      const left = cfg.loadMinMs - (Date.now() - this.loadStart);
+      if (left > 0) { clearTimeout(this.loadMinTimer); this.loadMinTimer = later(left + 2, () => this.loadCheck()); return; }   // too early (a timer can fire a millisecond before Date.now() says so): look again when the minimum is really over - never wait for the long timeout
       if (this.connected.some((p) => !p.bot && !p.loaded)) return;
       this.beginCountdown();
     }
