@@ -195,7 +195,28 @@ export function createDuels(userCfg, supa, log = () => {}, ctx = {}) {
 
   /* ---------------- queue and matchmaking ---------------- */
   const busy = (userId) => queue.has(userId) || userMatch.has(userId) || privByUser.has(userId);
-  const mkPlayer = (s, e) => ({ userId: s.user.id, name: e.name, level: e.level, rating: e.rating, conn: s.conn, bot: false, s });
+  const mkPlayer = (s, e) => ({ userId: s.user.id, name: e.name, level: e.level, rating: e.rating, conn: s.conn, bot: false, s, free: !!e.free });
+  /* A K54 Pass is needed for duels; a player without one has exactly ONE free duel (new accounts only). It is spent here, the moment a match really
+     starts - not when somebody joins the queue - so leaving the queue costs nothing and a practice or friend duel (never saved as a result) cannot be repeated for free.
+     Players with a pass start at once, exactly as before. */
+  function begin(m) {
+    const fp = m.players.filter((p) => !p.bot && p.free);
+    if (!fp.length) return m.start();
+    Promise.all(fp.map(async (p) => {
+      try { const r = await supa.rpc('k54_svc_duel_use_free', { p_user: p.userId }); return r && r.ok === false ? p : null; }
+      catch (e) { log('duel_free_error', { user: p.userId, err: String(e.message || e) }); return null; }       // a database hiccup never blocks a match
+    })).then((bad) => {
+      const no = bad.filter(Boolean);
+      if (!no.length) { if (!m.done) m.start(); return; }
+      matches.delete(m.id); m.done = true;
+      for (const p of m.players) {
+        if (p.bot) continue;
+        if (userMatch.get(p.userId) === m) userMatch.delete(p.userId);
+        const blocked = no.includes(p), sx = ctx.sess?.(p.userId) || p.s;
+        if (sx && !sx.conn.closed) { out(sx.conn, { t: 'err', code: blocked ? 'premium_required' : 'opp_unavailable' }); out(sx.conn, { t: 'dl', st: 'idle', waited: 0, size: queue.size }); }
+      }
+    });
+  }
 
   function qStatus(uid) {
     const w = queue.get(uid); if (!w) return;
@@ -223,7 +244,7 @@ export function createDuels(userCfg, supa, log = () => {}, ctx = {}) {
     queue.delete(a.s.user.id); queue.delete(b.s.user.id);
     const qn = clampN(a.e.questions | 0 || cfg.questions, 3, 20), ms = clampN(a.e.answer_ms | 0 || cfg.answerMs, cfg.minAnswerMs, cfg.maxAnswerMs);
     const pa = mkPlayer(a.s, a.e), pb = mkPlayer(b.s, b.e), m = new Match(pa, pb, qn, ms, false);
-    matches.set(m.id, m); userMatch.set(pa.userId, m); userMatch.set(pb.userId, m); m.start();
+    matches.set(m.id, m); userMatch.set(pa.userId, m); userMatch.set(pb.userId, m); begin(m);
   }
   function ensureTick() {
     if (tick || !queue.size) return;
@@ -256,7 +277,7 @@ export function createDuels(userCfg, supa, log = () => {}, ctx = {}) {
   /* the two players of a finished duel both asked for a rematch (or a friend joined a private room): a new match, same kind (friendly stays friendly) */
   function startPair(sa, ea, sb, eb, friendly, qn, ms) {
     const pa = mkPlayer(sa, ea), pb = mkPlayer(sb, eb), m = new Match(pa, pb, qn, ms, false, friendly);
-    matches.set(m.id, m); userMatch.set(pa.userId, m); userMatch.set(pb.userId, m); m.start(); return m;
+    matches.set(m.id, m); userMatch.set(pa.userId, m); userMatch.set(pb.userId, m); begin(m); return m;
   }
 
   async function handle(s, m) {
@@ -291,7 +312,7 @@ export function createDuels(userCfg, supa, log = () => {}, ctx = {}) {
         const skill = clampN(0.5 + (w.e.rating - 1000) / 2000 + Math.random() * 0.15, 0.45, 0.85);
         const bot = { userId: 'bot', name: names[0] + ' 🤖', level: me.level, rating: clampN(w.e.rating + randomInt(-60, 61), 100, 3000), conn: null, bot: true, skill };
         const mt = new Match(me, bot, clampN(w.e.questions | 0 || cfg.questions, 3, 20), clampN(w.e.answer_ms | 0 || cfg.answerMs, cfg.minAnswerMs, cfg.maxAnswerMs), true);
-        matches.set(mt.id, mt); userMatch.set(uid, mt); mt.start(); return;
+        matches.set(mt.id, mt); userMatch.set(uid, mt); begin(mt); return;
       }
       case 'dcreate': {                                                 // a private duel room: you get a code, a friend types it, the two of you duel (unrated, no coins)
         if (s.dbusy) return s.err('busy');
